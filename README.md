@@ -1,0 +1,195 @@
+# solana-shield 🛡
+
+**Systems-grade RPC and transaction reliability SDK for Solana dApps**, built on [`@solana/kit`](https://github.com/anza-xyz/kit) (the successor to web3.js, formerly web3.js v2).
+
+Solana dApps fail in production for boring reasons: an RPC provider has a bad day, a free tier rate-limits you, a node falls behind the cluster, a transaction is dropped during congestion. solana-shield wraps your whole RPC + transaction layer in a resilience stack that handles all of it — and ships the chaos-testing rig to prove it.
+
+```
+ your dApp ──► createShield()
+                 ├── rpc                    drop-in kit Rpc, resilient
+                 ├── sendReliably()         Jito → RPC fallback, fees, rebroadcast, confirm
+                 ├── health / metrics       live endpoint scoring, OpenTelemetry export
+                 └── solana-shield CLI      doctor · monitor · tx · fees
+```
+
+## Features
+
+- **Resilient transport** — retries with full-jitter backoff, per-endpoint circuit breakers, health-scored power-of-two-choices load balancing, 429/`Retry-After` cooldowns, slot-lag probing, optional hedged reads and request coalescing. All composed as plain functions over kit's `RpcTransport` — use the whole stack or any piece.
+- **MEV-protected sends** — route transactions through [Jito block engines](https://docs.jito.wtf/) (regional failover, live tip-floor tracking, 1 rps rate compliance, bundles API) with automatic fallback to regular RPC.
+- **Dynamic fee oracle** — races Helius `getPriorityFeeEstimate`, QuickNode `qn_estimatePriorityFees`, Triton percentile fees, and native `getRecentPrioritizationFees` inside a 400ms budget; aggregates max-of-sources with a hard ceiling so a misbehaving source can never drain you.
+- **Reliable transaction pipeline** — simulation-based compute budgets, WS + polling confirmation race, identical-bytes rebroadcast every 2.5s, exact blockhash-expiry detection. Never silently re-signs.
+- **Wallet-standard adapter** — dependency-free discovery + `TransactionSendingSigner` bridge; works with Phantom, Solflare, and any wallet-standard wallet. React apps can use `@solana/react` signers directly.
+- **Observability** — zero-dep in-process metrics, mirrored to OpenTelemetry (→ Datadog, Grafana, anything OTLP) when `@opentelemetry/api` is installed.
+- **Chaos engineering, shipped** — `solana-shield/chaos` injects drops, latency distributions, 429 storms, flapping outages, and slow-loris hangs into any transport, deterministically seeded. It's how this SDK reaches >90% test coverage, and how you can test *your* dApp.
+
+## Install
+
+```bash
+npm install solana-shield @solana/kit
+```
+
+## Quickstart
+
+```ts
+import { createShield, transferInstruction } from 'solana-shield';
+
+const shield = createShield({
+  endpoints: [
+    'https://mainnet.helius-rpc.com/?api-key=KEY',   // provider auto-detected → fee API used
+    { url: 'https://my-backup.example.com', weight: 2, rps: 10 },
+    'mainnet',                                        // monikers work too
+  ],
+  jito: { regions: ['frankfurt', 'amsterdam'] },      // omit for RPC-only routing
+});
+
+// 1. A drop-in, resilient kit RPC — use it anywhere an Rpc is expected
+const slot = await shield.rpc.getSlot().send();
+
+// 2. Reliable sends with a live event stream
+const handle = shield.sendReliably({
+  instructions: [transferInstruction(payer.address, recipient, 1_000_000n)],
+  signer: payer, // KeyPairSigner or wallet TransactionSendingSigner
+});
+
+for await (const event of handle) console.log(event.type, event);
+// building → feeEstimated → signed → sent(via jito) → confirmed
+
+const { signature, slot: landedSlot } = await handle.result;
+```
+
+`handle.result` rejects with `TxExpiredError` (blockhash lifetime ended — safe to rebuild) or `TxFailedError` (landed but failed on chain). The pipeline **never** rebuilds and re-signs behind your back.
+
+### Wallets (Phantom & friends)
+
+```ts
+import { watchWallets, createSignerFromWalletAccount } from 'solana-shield/wallet';
+
+watchWallets(wallets => {
+  const phantom = wallets.find(w => w.name === 'Phantom');
+  // after wallet.features['standard:connect'].connect():
+  const signer = createSignerFromWalletAccount(phantom, account);
+  shield.sendReliably({ instructions, signer }); // wallet signs & sends; shield confirms & tracks
+});
+```
+
+React apps already on `@solana/react` need zero glue — pass the signer from
+`useWalletAccountTransactionSendingSigner()` straight into `sendReliably`.
+See [`examples/react-phantom`](examples/react-phantom) for a complete Vite app.
+
+> Sending-only wallet signers can't export signed bytes, so Jito routing degrades
+> to RPC automatically with an explicit `jitoFallback` event — documented, not silent.
+
+## Chaos testing your dApp
+
+```ts
+import { createChaosTransport, scenarios } from 'solana-shield/chaos';
+import { createDefaultRpcTransport } from '@solana/kit';
+
+const hostile = createChaosTransport(
+  createDefaultRpcTransport({ url: 'https://api.devnet.solana.com' }),
+  { ...scenarios.degradedProvider, seed: 42 },   // deterministic: same seed, same faults
+);
+// Hand `hostile` to createShield via transportFactory, or to kit directly —
+// then watch your app survive drops, 502s, 429 storms, and slow-loris hangs.
+```
+
+Presets: `degradedProvider`, `rateLimitStorm`, `laggingNode`, `regionalOutage`, `recoveringPartition`, `slowLoris`. Full `FaultPlan` control: latency distributions (fixed/normal/pareto), per-method JSON-RPC errors, phased schedules.
+
+## Observability (OpenTelemetry / Datadog)
+
+```ts
+import { enableOpenTelemetry } from 'solana-shield/telemetry';
+await enableOpenTelemetry(shield.metrics); // no-op if @opentelemetry/api absent
+```
+
+Wire any OTLP backend in your app (Datadog Agent example):
+
+```ts
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http';
+import { PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
+
+new NodeSDK({
+  metricReader: new PeriodicExportingMetricReader({
+    exporter: new OTLPMetricExporter({ url: 'http://localhost:4318/v1/metrics' }),
+  }),
+}).start();
+```
+
+Exported metrics: `solana_shield.rpc.request.duration|count` (per endpoint/method/outcome/failure-kind), `endpoint.health_score`, `endpoint.slot_lag`, `tx.confirmation.duration`, `tx.outcome`, `fees.source.duration`, `jito.tip_lamports`, and more.
+
+## Diagnostics CLI
+
+```bash
+npx solana-shield doctor    --endpoints "https://rpc1...,https://rpc2..."
+npx solana-shield monitor   --methods          # live health table @1Hz
+npx solana-shield tx <signature> --watch
+npx solana-shield fees      --level high
+```
+
+`doctor` checks reachability, node versions, WebSocket connectivity, fee sources, the Jito tip floor — and runs a **provider-agreement check** (slot consensus across your pool) that catches stale nodes that pass naive health checks. Exit code 0/1 + `--json` make it CI-friendly.
+
+```
+# Endpoints
+ENDPOINT                REACHABLE  VERSION       LATENCY  SLOT LAG  AGREES  WS  NOTES
+api.devnet.solana.com   yes        4.1.0-beta.1  271ms    0         yes     ok  -
+backup.example.com      yes        4.1.0-beta.1  451ms    84        NO      ok  -
+```
+
+Config resolution: `--endpoints` flag → `--config file` → `./solana-shield.config.json` → `SOLANA_SHIELD_ENDPOINTS` env.
+
+## How the resilience works
+
+```mermaid
+flowchart TD
+    A[rpc.getSlot / sendReliably] --> C{coalesce*}
+    C --> H{hedge*}
+    H --> R[retry loop · full-jitter backoff]
+    R --> S[selector · weighted P2C over health scores]
+    S --> E1[endpoint A<br/>breaker · cooldown · rps cap]
+    S --> E2[endpoint B<br/>breaker · cooldown · rps cap]
+    E1 --> F[classify failure]
+    E2 --> F
+    F -->|retryable / rotate| R
+    F -->|client error| X[throw original]
+    F -->|success| OK[response]
+```
+<sub>*opt-in middlewares</sub>
+
+Every failure normalizes through one classification table (`network / timeout / HTTP / JSON-RPC node-health`) that decides: retryable? endpoint's fault? cooldown? dead (bad API key)? Health scores weight **success rate cubed** over latency and slot lag (reliability beats raw speed — methodology borrowed from Chainstack's public RPC benchmarks), and a total outage can never deadlock: the selector force-half-opens the best breaker so recovery is always probed.
+
+## Using with gill
+
+[gill](https://github.com/gillsdk/gill) users: solana-shield's `rpc`/`rpcSubscriptions`/`transport` are standard kit objects, so they compose directly:
+
+```ts
+import { sendAndConfirmTransactionFactory } from 'gill';
+const sendAndConfirm = sendAndConfirmTransactionFactory({
+  rpc: shield.rpc,
+  rpcSubscriptions: shield.rpcSubscriptions[0],
+});
+```
+
+## Testing
+
+```bash
+pnpm test              # 295+ tests
+pnpm test:coverage     # enforces ≥90% lines/branches/functions/statements
+```
+
+The suite runs entirely without sockets: every component is a function over `RpcTransport`, tested against scriptable mocks and the shipped ChaosTransport with seeded PRNGs (`test/scenarios/` — degraded providers, rate-limit storms, total partitions with recovery, blockhash expiry under 100% packet loss — all deterministic, never flaky).
+
+## Package map
+
+| Import | Contents |
+|---|---|
+| `solana-shield` | `createShield`, everything re-exported |
+| `solana-shield/transport` | resilient transport stack, middlewares, classification |
+| `solana-shield/tx` | `sendReliably` pipeline, confirmation, events |
+| `solana-shield/fees` | fee oracle + Helius/QuickNode/Triton/native sources |
+| `solana-shield/jito` | `JitoSender` (transactions, bundles, tips) |
+| `solana-shield/wallet` | wallet-standard discovery + signer bridge |
+| `solana-shield/telemetry` | metrics registry + OpenTelemetry mirror |
+| `solana-shield/chaos` | `createChaosTransport`, scenario presets, seeded PRNG |
+
+Node ≥ 20 · TypeScript strict · ESM + CJS · browser-safe core (Node APIs only in the CLI) · MIT

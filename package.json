@@ -1,0 +1,113 @@
+{
+  "name": "solana-shield",
+  "version": "0.1.0",
+  "description": "Systems-grade RPC and transaction reliability SDK for Solana dApps, built on @solana/kit (web3.js v2). Resilient transports, Jito MEV routing with RPC fallback, dynamic fee oracles, chaos testing, and observability.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "solana-shield": "./dist/cli/main.js"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./transport": {
+      "types": "./dist/transport/index.d.ts",
+      "import": "./dist/transport/index.js",
+      "require": "./dist/transport/index.cjs"
+    },
+    "./fees": {
+      "types": "./dist/fees/index.d.ts",
+      "import": "./dist/fees/index.js",
+      "require": "./dist/fees/index.cjs"
+    },
+    "./jito": {
+      "types": "./dist/jito/index.d.ts",
+      "import": "./dist/jito/index.js",
+      "require": "./dist/jito/index.cjs"
+    },
+    "./tx": {
+      "types": "./dist/tx/index.d.ts",
+      "import": "./dist/tx/index.js",
+      "require": "./dist/tx/index.cjs"
+    },
+    "./wallet": {
+      "types": "./dist/wallet/index.d.ts",
+      "import": "./dist/wallet/index.js",
+      "require": "./dist/wallet/index.cjs"
+    },
+    "./telemetry": {
+      "types": "./dist/telemetry/index.d.ts",
+      "import": "./dist/telemetry/index.js",
+      "require": "./dist/telemetry/index.cjs"
+    },
+    "./chaos": {
+      "types": "./dist/chaos/index.d.ts",
+      "import": "./dist/chaos/index.js",
+      "require": "./dist/chaos/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "verify": "pnpm typecheck && pnpm lint && pnpm test:coverage && pnpm build"
+  },
+  "keywords": [
+    "solana",
+    "web3js",
+    "solana-kit",
+    "rpc",
+    "resilience",
+    "jito",
+    "mev",
+    "priority-fees",
+    "opentelemetry",
+    "chaos-engineering"
+  ],
+  "dependencies": {
+    "commander": "^15.0.0",
+    "picocolors": "^1.1.1"
+  },
+  "peerDependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@solana/kit": "^6.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/api": {
+      "optional": true
+    }
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "devDependencies": {
+    "@opentelemetry/api": "^1.9.1",
+    "@solana/kit": "^6.9.0",
+    "@types/node": "^25.9.2",
+    "@vitest/coverage-v8": "^4.1.8",
+    "@wallet-standard/base": "^1.1.1",
+    "eslint": "^10.4.1",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.0",
+    "vitest": "^4.1.8"
+  }
+}

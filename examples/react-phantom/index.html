@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>solana-shield × Phantom</title>
+    <style>
+      body { font-family: ui-monospace, monospace; background: #0b0e14; color: #d6deeb; margin: 2rem; }
+      button { background: #7c3aed; color: white; border: 0; padding: 0.6rem 1.2rem; border-radius: 6px; cursor: pointer; font-size: 1rem; }
+      button:disabled { opacity: 0.4; cursor: default; }
+      .event { padding: 0.25rem 0.5rem; border-left: 3px solid #334; margin: 0.2rem 0; }
+      .event.confirmed { border-color: #22c55e; }
+      .event.failed, .event.expired { border-color: #ef4444; }
+      .event.jitoFallback { border-color: #eab308; }
+      table { border-collapse: collapse; margin: 1rem 0; }
+      td, th { border: 1px solid #334; padding: 0.3rem 0.8rem; text-align: left; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
