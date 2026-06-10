@@ -1,6 +1,6 @@
 /** Second round of branch-gap coverage. */
 import { createSolanaRpcFromTransport } from '@solana/kit';
-import type { Signature } from '@solana/kit';
+import type { Signature, TransactionSendingSigner } from '@solana/kit';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { renderFeesReport, runFees } from '../../src/cli/commands/fees.js';
 import { renderMonitorFrame } from '../../src/cli/commands/monitor.js';
@@ -259,7 +259,7 @@ describe('wallet chain fallback', () => {
         },
       },
     } as unknown as Wallet;
-    const signer = createSignerFromWalletAccount(wallet, account);
+    const signer = createSignerFromWalletAccount(wallet, account) as TransactionSendingSigner;
     // Build a real transaction is unnecessary — the encoder only runs per item;
     // an empty batch exercises the chain selection without wallet interaction.
     await signer.signAndSendTransactions([]);

@@ -66,7 +66,12 @@ export interface SendReliablyInput {
   readonly instructions: readonly Instruction[];
   readonly signer: TransactionSigner;
   readonly commitment?: Commitment;
-  /** 'auto' (default): Jito first with automatic RPC fallback; or force one route. */
+  /**
+   * Routing policy:
+   * - 'auto' (default): Jito first when configured, automatic RPC fallback;
+   * - 'jito': Jito only — failures surface instead of silently falling back;
+   * - 'rpc': never touch Jito.
+   */
   readonly route?: 'auto' | 'jito' | 'rpc';
   readonly feeLevel?: FeeLevel;
   /** Hard ceiling so a misbehaving fee source can never drain the payer. */
@@ -187,6 +192,13 @@ async function runPipeline(
       throw new Error("route 'jito' requested but no Jito sender is configured");
     }
     if (wantJito && !ownsBytes) {
+      if (route === 'jito') {
+        throw new Error(
+          "route 'jito' requires a signer that can export signed bytes; " +
+            'this wallet only supports signAndSendTransaction (it submits itself). ' +
+            "Use route 'auto' or a wallet exposing solana:signTransaction.",
+        );
+      }
       events.push({ type: 'jitoFallback', reason: 'signerCannotExportBytes' });
     }
 
@@ -256,6 +268,9 @@ async function runPipeline(
             await jito.sendTransaction(wire, { signal });
             return 'jito';
           } catch (err) {
+            // 'jito' is a strict policy: surface the failure, never silently
+            // downgrade an explicitly frontrun-protected send to public RPC.
+            if (route === 'jito') throw err;
             events.push({
               type: 'jitoFallback',
               reason: 'jitoSendFailed',
@@ -289,9 +304,10 @@ async function runPipeline(
         rebroadcastAbort.abort();
       };
       void startRebroadcast({
-        // Alternate routes so a black-holing Jito region can't absorb every resend.
+        // Alternate routes so a black-holing Jito region can't absorb every
+        // resend — except under the strict 'jito' policy, which never mixes.
         send: async attempt => {
-          const via = await sendOnce(useJito && attempt % 2 === 1);
+          const via = await sendOnce(useJito && (route === 'jito' || attempt % 2 === 1));
           events.push({ type: 'resent', via, attempt });
         },
         ...(input.rebroadcastIntervalMs !== undefined

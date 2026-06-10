@@ -59,6 +59,47 @@ const { signature, slot: landedSlot } = await handle.result;
 
 `handle.result` rejects with `TxExpiredError` (blockhash lifetime ended — safe to rebuild) or `TxFailedError` (landed but failed on chain). The pipeline **never** rebuilds and re-signs behind your back.
 
+### Migrating from vanilla kit
+
+```ts
+// before
+import { createSolanaRpc } from '@solana/kit';
+const rpc = createSolanaRpc('https://api.mainnet-beta.solana.com');
+
+// after — same Rpc type, every call now retried/balanced/breakered
+import { createShield } from 'solana-shield';
+const { rpc } = createShield({ endpoints: ['https://rpc1...', 'https://rpc2...'] });
+```
+
+### Routing policies
+
+| `route` | Behavior |
+|---|---|
+| `'auto'` (default) | Jito first when configured, automatic RPC fallback with a `jitoFallback` event |
+| `'jito'` | Strict: failures surface, a frontrun-protected send is **never** silently downgraded to public RPC |
+| `'rpc'` | Never touches Jito |
+
+### Composing the transport yourself
+
+Everything is a function over kit's `RpcTransport`, so you can assemble your own stack and hand it to kit directly:
+
+```ts
+import { createSolanaRpcFromTransport, createDefaultRpcTransport } from '@solana/kit';
+import {
+  createResilientTransport, composeTransport,
+  createHedgingMiddleware, createCoalescingMiddleware,
+} from 'solana-shield/transport';
+
+const { transport, health } = createResilientTransport({
+  endpoints: urls.map((url, i) => ({ id: `rpc-${i}`, url, transport: createDefaultRpcTransport({ url }) })),
+});
+const rpc = createSolanaRpcFromTransport(
+  composeTransport(transport, createCoalescingMiddleware(), createHedgingMiddleware({ delayMs: 200 })),
+);
+```
+
+Retry, circuit breaking, and load balancing live *inside* `createResilientTransport` rather than as standalone wrappers — deliberately: the breaker is per-endpoint and retries must re-run endpoint selection, which requires shared endpoint identity that independent flat wrappers can't see.
+
 ### Wallets (Phantom & friends)
 
 ```ts
@@ -76,8 +117,17 @@ React apps already on `@solana/react` need zero glue — pass the signer from
 `useWalletAccountTransactionSendingSigner()` straight into `sendReliably`.
 See [`examples/react-phantom`](examples/react-phantom) for a complete Vite app.
 
-> Sending-only wallet signers can't export signed bytes, so Jito routing degrades
-> to RPC automatically with an explicit `jitoFallback` event — documented, not silent.
+The bridge picks the **best wallet feature automatically**:
+
+- `solana:signTransaction` → the wallet *only signs*; solana-shield keeps the
+  signed bytes, so wallet users get full Jito routing **and** rebroadcast.
+- `solana:signAndSendTransaction` (fallback) → the wallet signs and submits
+  itself; the route degrades to RPC with an explicit `jitoFallback` event,
+  and solana-shield still owns confirmation, expiry tracking, and events.
+
+Coming from legacy `@solana/web3.js` 1.x objects (`PublicKey`,
+`VersionedTransaction`)? Use [`@solana/compat`](https://www.npmjs.com/package/@solana/compat)
+to convert to kit types at the boundary — everything here speaks kit.
 
 ## Chaos testing your dApp
 

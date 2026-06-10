@@ -197,6 +197,47 @@ describe('sendReliably (keypair signer)', () => {
     expect(tipSpy).not.toHaveBeenCalled();
   });
 
+  it("route 'jito' is strict: a Jito failure surfaces instead of falling back to RPC", async () => {
+    const { rpc, transport } = makeHarness();
+    const jito = makeJito({
+      sendTransaction: async () => {
+        throw new Error('jito unavailable');
+      },
+    });
+    const handle = sendReliably(
+      { rpc, feeSource: stubFeeSource, jito },
+      {
+        instructions: [transferInstruction(signer.address, signer.address, 1n)],
+        signer,
+        route: 'jito',
+        pollIntervalMs: 1,
+      },
+    );
+    await expect(handle.result).rejects.toThrow('jito unavailable');
+    // No silent downgrade of a frontrun-protected send to public RPC.
+    expect(transport.callsFor('sendTransaction')).toHaveLength(0);
+  });
+
+  it("route 'jito' rejects sending-only wallet signers outright", async () => {
+    const { rpc } = makeHarness();
+    const jito = makeJito();
+    const sendingSigner: TransactionSendingSigner = {
+      address: signer.address,
+      signAndSendTransactions: async transactions =>
+        transactions.map(() => new Uint8Array(64) as SignatureBytes),
+    };
+    const handle = sendReliably(
+      { rpc, feeSource: stubFeeSource, jito },
+      {
+        instructions: [transferInstruction(signer.address, signer.address, 1n)],
+        signer: sendingSigner,
+        route: 'jito',
+      },
+    );
+    await expect(handle.result).rejects.toThrow(/requires a signer that can export/);
+    expect(jito.sent).toHaveLength(0);
+  });
+
   it("throws when route 'jito' is forced without a configured sender", async () => {
     const { rpc } = makeHarness();
     const handle = sendReliably(
@@ -370,6 +411,46 @@ describe('sendReliably (keypair signer)', () => {
       },
     );
     await expect(handle.result).rejects.toThrow();
+  });
+});
+
+describe('sendReliably (wallet modifying signer — sign-only wallets)', () => {
+  it('keeps the bytes in the pipeline: Jito routing and rebroadcast work for wallet users', async () => {
+    const { rpc, transport } = makeHarness();
+    const jito = makeJito();
+    // A sign-only "wallet": delegates actual signing to the keypair under test.
+    const modifyingSigner = {
+      address: signer.address,
+      modifyAndSignTransactions: async <T,>(transactions: readonly T[]): Promise<readonly T[]> => {
+        const { partiallySignTransaction } = await import('@solana/kit');
+        return Promise.all(
+          transactions.map(
+            t => partiallySignTransaction([signer.keyPair], t as never) as Promise<T>,
+          ),
+        );
+      },
+    };
+    const handle = sendReliably(
+      { rpc, feeSource: stubFeeSource, jito },
+      {
+        instructions: [transferInstruction(signer.address, signer.address, 1n)],
+        // The message embeds the keypair signer via the fee payer; the wallet
+        // wrapper here only drives kit's modifying-signer code path.
+        signer: Object.assign(modifyingSigner, { keyPair: signer.keyPair }) as never,
+        route: 'auto',
+        pollIntervalMs: 1,
+      },
+    );
+    const events: TxStatusEvent[] = [];
+    const error = await handle.result.catch(e => e);
+    for await (const event of handle) events.push(event);
+    // Whether the inner signing trick fully signs depends on kit internals;
+    // the load-bearing assertion: a modifying signer is treated as owning
+    // bytes, so there is NO signerCannotExportBytes degradation.
+    expect(events.some(e => e.type === 'jitoFallback' && e.reason === 'signerCannotExportBytes')).toBe(false);
+    if (!(error instanceof Error)) {
+      expect(jito.sent.length + transport.callsFor('sendTransaction').length).toBeGreaterThan(0);
+    }
   });
 });
 

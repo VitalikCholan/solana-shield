@@ -1,8 +1,10 @@
 import type { Wallet, WalletAccount } from '@wallet-standard/base';
+import type { TransactionSendingSigner } from '@solana/kit';
 import {
   generateKeyPairSigner,
   getBase58Decoder,
   getBase64EncodedWireTransaction,
+  getTransactionEncoder,
   signTransactionMessageWithSigners,
   appendTransactionMessageInstructions,
   createTransactionMessage,
@@ -128,7 +130,7 @@ describe('createSignerFromWalletAccount', () => {
       return inputs.map(() => ({ signature: walletSignature }));
     });
 
-    const signer = createSignerFromWalletAccount(wallet, account);
+    const signer = createSignerFromWalletAccount(wallet, account) as TransactionSendingSigner;
     expect(signer.address).toBe(keypair.address);
     const signatures = await signer.signAndSendTransactions([transaction]);
     expect(signatures).toEqual([walletSignature]);
@@ -155,16 +157,84 @@ describe('createSignerFromWalletAccount', () => {
       seenChain = (inputs[0] as { chain: string }).chain;
       return [{ signature: new Uint8Array(64) }];
     });
-    const signer = createSignerFromWalletAccount(wallet, account, { chain: 'solana:mainnet' });
+    const signer = createSignerFromWalletAccount(wallet, account, {
+      chain: 'solana:mainnet',
+    }) as TransactionSendingSigner;
     await signer.signAndSendTransactions([transaction]);
     expect(seenChain).toBe('solana:mainnet');
   });
 
-  it('throws a helpful error for wallets without signAndSendTransaction', () => {
+  it('throws a helpful error for wallets without any signing feature', () => {
     const account = makeAccount('x');
     const wallet = makeWallet('Bare', account);
     expect(() => createSignerFromWalletAccount(wallet, account)).toThrow(
-      /does not support solana:signAndSendTransaction/,
+      /supports neither solana:signTransaction nor solana:signAndSendTransaction/,
     );
+  });
+
+  it('prefers solana:signTransaction, returning a modifying signer that round-trips bytes', async () => {
+    const keypair = await generateKeyPairSigner();
+    const blockhash = getBase58Decoder().decode(new Uint8Array(32).fill(6)) as Blockhash;
+    const unsigned = pipe(
+      createTransactionMessage({ version: 0 }),
+      m => setTransactionMessageFeePayerSigner(keypair, m),
+      m => setTransactionMessageLifetimeUsingBlockhash({ blockhash, lastValidBlockHeight: 1n }, m),
+      m => appendTransactionMessageInstructions([transferInstruction(keypair.address, keypair.address, 1n)], m),
+    );
+    const reference = await signTransactionMessageWithSigners(unsigned);
+
+    const account = makeAccount(keypair.address);
+    const received: Uint8Array[] = [];
+    const wallet = {
+      version: '1.0.0',
+      name: 'SignOnly',
+      icon: 'data:image/svg+xml;base64,',
+      chains: ['solana:devnet'],
+      accounts: [account],
+      features: {
+        // Both features present: signTransaction must win.
+        'solana:signAndSendTransaction': {
+          version: '1.0.0',
+          signAndSendTransaction: async () => {
+            throw new Error('should not be called');
+          },
+        },
+        'solana:signTransaction': {
+          version: '1.0.0',
+          signTransaction: async (
+            ...inputs: Array<{ transaction: Uint8Array }>
+          ): Promise<Array<{ signedTransaction: Uint8Array }>> => {
+            // The fake wallet "signs" by returning the reference signed bytes.
+            inputs.forEach(i => received.push(i.transaction));
+            const encoder = getTransactionEncoder();
+            return inputs.map(() => ({
+              signedTransaction: new Uint8Array(encoder.encode(reference)),
+            }));
+          },
+        },
+      },
+    } as unknown as Wallet;
+
+    const signer = createSignerFromWalletAccount(wallet, account);
+    expect('modifyAndSignTransactions' in signer).toBe(true);
+    const modifying = signer as Extract<typeof signer, { modifyAndSignTransactions: unknown }>;
+    const [signed] = await modifying.modifyAndSignTransactions([reference]);
+    expect(received).toHaveLength(1);
+    // Round trip: encode(decode(bytes)) is byte-identical.
+    const encoder = getTransactionEncoder();
+    expect(Buffer.from(encoder.encode(signed!)).equals(Buffer.from(encoder.encode(reference)))).toBe(true);
+  });
+
+  it('preferSignOnly: false forces the sign-and-send path', async () => {
+    const account = makeAccount('addr');
+    const wallet = makeWallet('Phantom', account, async (...inputs) =>
+      inputs.map(() => ({ signature: new Uint8Array(64) })),
+    );
+    (wallet.features as Record<string, unknown>)['solana:signTransaction'] = {
+      version: '1.0.0',
+      signTransaction: async () => [],
+    };
+    const signer = createSignerFromWalletAccount(wallet, account, { preferSignOnly: false });
+    expect('signAndSendTransactions' in signer).toBe(true);
   });
 });

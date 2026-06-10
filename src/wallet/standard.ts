@@ -1,6 +1,12 @@
 import type { Wallet, WalletAccount } from '@wallet-standard/base';
-import type { Address, SignatureBytes, Transaction, TransactionSendingSigner } from '@solana/kit';
-import { getTransactionEncoder } from '@solana/kit';
+import type {
+  Address,
+  SignatureBytes,
+  Transaction,
+  TransactionModifyingSigner,
+  TransactionSendingSigner,
+} from '@solana/kit';
+import { getTransactionDecoder, getTransactionEncoder } from '@solana/kit';
 
 /**
  * Dependency-free wallet-standard integration.
@@ -77,6 +83,7 @@ export function watchWallets(onChange: (wallets: readonly Wallet[]) => void): ()
 }
 
 const SIGN_AND_SEND_FEATURE = 'solana:signAndSendTransaction';
+const SIGN_TRANSACTION_FEATURE = 'solana:signTransaction';
 
 interface SignAndSendFeature {
   signAndSendTransaction(
@@ -88,42 +95,83 @@ interface SignAndSendFeature {
   ): Promise<ReadonlyArray<{ readonly signature: Uint8Array }>>;
 }
 
+interface SignTransactionFeature {
+  signTransaction(
+    ...inputs: Array<{
+      readonly account: WalletAccount;
+      readonly chain?: string;
+      readonly transaction: Uint8Array;
+    }>
+  ): Promise<ReadonlyArray<{ readonly signedTransaction: Uint8Array }>>;
+}
+
 export interface CreateSignerOptions {
   /** Chain to submit on (default: the account's first `solana:` chain). */
   readonly chain?: string;
+  /**
+   * Prefer `solana:signTransaction` when the wallet offers it (default true).
+   * Sign-only wallets let solana-shield keep the signed bytes, which unlocks
+   * Jito routing and rebroadcast for wallet users. Set to false to force the
+   * wallet's own send path.
+   */
+  readonly preferSignOnly?: boolean;
 }
 
 /**
- * Adapt a wallet-standard account into a kit `TransactionSendingSigner`,
- * ready for `shield.sendReliably({ signer, ... })`.
+ * Adapt a wallet-standard account into a kit signer for
+ * `shield.sendReliably({ signer, ... })`.
  *
- * Note: a sending signer signs AND submits in the wallet, so solana-shield
- * cannot export the signed bytes — `sendReliably` automatically degrades the
- * route to RPC (emitting an explicit `jitoFallback` event) and still owns
- * confirmation, expiry tracking, and status events.
+ * Feature selection, best-first:
+ * 1. `solana:signTransaction` → a `TransactionModifyingSigner`: the wallet only
+ *    signs, solana-shield owns the wire bytes — full Jito routing + rebroadcast.
+ * 2. `solana:signAndSendTransaction` → a `TransactionSendingSigner`: the wallet
+ *    signs AND submits, so the route degrades to RPC (with an explicit
+ *    `jitoFallback` event); solana-shield still owns confirmation and expiry.
  */
 export function createSignerFromWalletAccount(
   wallet: Wallet,
   account: WalletAccount,
   options: CreateSignerOptions = {},
-): TransactionSendingSigner {
-  const feature = wallet.features[SIGN_AND_SEND_FEATURE] as SignAndSendFeature | undefined;
-  if (!feature || typeof feature.signAndSendTransaction !== 'function') {
-    throw new Error(
-      `Wallet "${wallet.name}" does not support ${SIGN_AND_SEND_FEATURE}. ` +
-        `Available features: ${Object.keys(wallet.features).join(', ')}`,
-    );
-  }
+): TransactionModifyingSigner | TransactionSendingSigner {
   const chain =
     options.chain ?? account.chains.find(c => c.startsWith('solana:')) ?? 'solana:mainnet';
   const encoder = getTransactionEncoder();
+
+  const signOnly = wallet.features[SIGN_TRANSACTION_FEATURE] as SignTransactionFeature | undefined;
+  if (options.preferSignOnly !== false && typeof signOnly?.signTransaction === 'function') {
+    const decoder = getTransactionDecoder();
+    const modifyingSigner: TransactionModifyingSigner = {
+      address: account.address as Address,
+      async modifyAndSignTransactions(transactions) {
+        const outputs = await signOnly.signTransaction(
+          ...transactions.map(transaction => ({
+            account,
+            chain,
+            transaction: new Uint8Array(encoder.encode(transaction)),
+          })),
+        );
+        return outputs.map(o => decoder.decode(o.signedTransaction)) as unknown as Awaited<
+          ReturnType<TransactionModifyingSigner['modifyAndSignTransactions']>
+        >;
+      },
+    };
+    return modifyingSigner;
+  }
+
+  const sendAndSign = wallet.features[SIGN_AND_SEND_FEATURE] as SignAndSendFeature | undefined;
+  if (!sendAndSign || typeof sendAndSign.signAndSendTransaction !== 'function') {
+    throw new Error(
+      `Wallet "${wallet.name}" supports neither ${SIGN_TRANSACTION_FEATURE} nor ${SIGN_AND_SEND_FEATURE}. ` +
+        `Available features: ${Object.keys(wallet.features).join(', ')}`,
+    );
+  }
 
   return {
     address: account.address as Address,
     async signAndSendTransactions(
       transactions: readonly Transaction[],
     ): Promise<readonly SignatureBytes[]> {
-      const outputs = await feature.signAndSendTransaction(
+      const outputs = await sendAndSign.signAndSendTransaction(
         ...transactions.map(transaction => ({
           account,
           chain,
@@ -135,9 +183,11 @@ export function createSignerFromWalletAccount(
   };
 }
 
-/** Wallets exposing `solana:signAndSendTransaction` (i.e. usable with this SDK). */
+/** Wallets usable with this SDK (sign-only or sign-and-send capable). */
 export function getCompatibleWallets(): readonly Wallet[] {
-  return getDiscoveredWallets().filter(w => SIGN_AND_SEND_FEATURE in w.features);
+  return getDiscoveredWallets().filter(
+    w => SIGN_TRANSACTION_FEATURE in w.features || SIGN_AND_SEND_FEATURE in w.features,
+  );
 }
 
 /** Test hook: clear module-level discovery state. */
