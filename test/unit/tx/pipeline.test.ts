@@ -101,6 +101,9 @@ describe('sendReliably (keypair signer)', () => {
     const confirmed = await handle.result;
     expect(confirmed.type).toBe('confirmed');
     expect(confirmed.confirmedVia).toBe('poll');
+    expect(confirmed.route).toBe('rpc');
+    expect(confirmed.attempts).toBe(1);
+    expect(confirmed.durationMs).toBeGreaterThanOrEqual(0);
     expect(await handle.signature).toBe(confirmed.signature);
 
     const events = await collectEvents(handle);

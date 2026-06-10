@@ -3,6 +3,7 @@ import type { FeeLevel } from '../fees/types.js';
 import { createShield } from '../index.js';
 import type { Shield } from '../index.js';
 import { loadCliConfig } from './config.js';
+import { renderBenchReport, runBench } from './commands/bench.js';
 import { renderDoctorReport, runDoctor } from './commands/doctor.js';
 import { renderFeesReport, runFees } from './commands/fees.js';
 import { runMonitor } from './commands/monitor.js';
@@ -83,6 +84,28 @@ program
         : await fetchTxStatus(shield, signature);
       console.log(renderTxSummary(summary, options.json));
       process.exitCode = summary.found && !summary.err ? 0 : 1;
+    } finally {
+      shield.destroy();
+    }
+  });
+
+program
+  .command('bench')
+  .description('latency/throughput benchmark of each configured endpoint (bypasses retries)')
+  .option('-n, --requests <count>', 'requests per endpoint', '50')
+  .option('--concurrency <count>', 'concurrent requests per endpoint', '5')
+  .option('-m, --method <method>', 'RPC method to benchmark', 'getSlot')
+  .option('--json', 'machine-readable output', false)
+  .action(async (options: { requests: string; concurrency: string; method: string; json: boolean }) => {
+    const shield = buildShield({ slotProbe: false });
+    try {
+      const results = await runBench(shield, {
+        requests: Number(options.requests),
+        concurrency: Number(options.concurrency),
+        method: options.method,
+        signal: onSigint(),
+      });
+      console.log(renderBenchReport(results, options.json));
     } finally {
       shield.destroy();
     }

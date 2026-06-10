@@ -32,3 +32,21 @@ jobs:
       - run: pnpm build
       - name: CLI smoke test
         run: node dist/cli/main.js --help
+
+  # Early warning, never blocking: does the next @solana/kit release break us?
+  kit-latest:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm add -D @solana/kit@latest
+      - run: pnpm typecheck
+      - run: pnpm test

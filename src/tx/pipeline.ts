@@ -253,6 +253,8 @@ async function runPipeline(
     // --- sign + send ---
     let txSignature: Signature;
     let stopRebroadcast: (() => void) | undefined;
+    let lastRoute: 'jito' | 'rpc' = 'rpc';
+    let broadcastAttempts = 1;
 
     if (ownsBytes) {
       const transaction = await signTransactionMessageWithSigners(message);
@@ -289,6 +291,7 @@ async function runPipeline(
       };
 
       const via = await sendOnce(true);
+      lastRoute = via;
       events.push({
         type: 'sent',
         via,
@@ -308,6 +311,8 @@ async function runPipeline(
         // resend — except under the strict 'jito' policy, which never mixes.
         send: async attempt => {
           const via = await sendOnce(useJito && (route === 'jito' || attempt % 2 === 1));
+          lastRoute = via;
+          broadcastAttempts = attempt + 1;
           events.push({ type: 'resent', via, attempt });
         },
         ...(input.rebroadcastIntervalMs !== undefined
@@ -366,6 +371,9 @@ async function runPipeline(
       commitment,
       slot: confirmation.slot,
       confirmedVia: confirmation.via,
+      route: lastRoute,
+      attempts: broadcastAttempts,
+      durationMs: Date.now() - startedAt,
     };
     events.push(confirmedEvent);
     context.metrics?.count('solana_shield.tx.outcome', { outcome: 'confirmed' });

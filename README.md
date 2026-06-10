@@ -173,6 +173,7 @@ Exported metrics: `solana_shield.rpc.request.duration|count` (per endpoint/metho
 ```bash
 npx solana-shield doctor    --endpoints "https://rpc1...,https://rpc2..."
 npx solana-shield monitor   --methods          # live health table @1Hz
+npx solana-shield bench     -n 100             # per-endpoint latency/throughput
 npx solana-shield tx <signature> --watch
 npx solana-shield fees      --level high
 ```
@@ -223,11 +224,34 @@ const sendAndConfirm = sendAndConfirmTransactionFactory({
 ## Testing
 
 ```bash
-pnpm test              # 295+ tests
+pnpm test              # 300+ tests
 pnpm test:coverage     # enforces ≥90% lines/branches/functions/statements
 ```
 
-The suite runs entirely without sockets: every component is a function over `RpcTransport`, tested against scriptable mocks and the shipped ChaosTransport with seeded PRNGs (`test/scenarios/` — degraded providers, rate-limit storms, total partitions with recovery, blockhash expiry under 100% packet loss — all deterministic, never flaky).
+The suite runs entirely without sockets: every component is a function over `RpcTransport`, tested against scriptable mocks and the shipped ChaosTransport with seeded PRNGs — deterministic, never flaky. Named resilience scenarios:
+
+| Scenario | Test |
+|---|---|
+| One provider degraded (70% drops + 502s) → 60/60 requests still succeed, traffic shifts | [`test/scenarios/resilience.test.ts`](test/scenarios/resilience.test.ts) |
+| Rate-limit storm with `Retry-After` → cooldown honored, zero requests wasted on the throttled node | [`test/scenarios/resilience.test.ts`](test/scenarios/resilience.test.ts) |
+| Total partition → breakers open → network heals → recovery without deadlock | [`test/scenarios/resilience.test.ts`](test/scenarios/resilience.test.ts) |
+| Node-behind (-32005) responses transparently retried on in-sync nodes | [`test/scenarios/resilience.test.ts`](test/scenarios/resilience.test.ts) |
+| Transaction lands through retries while the network drops 35% of requests | [`test/scenarios/pipeline-chaos.test.ts`](test/scenarios/pipeline-chaos.test.ts) |
+| Blockhash expires under 100% send-loss → exact `TxExpiredError`, never a silent re-sign | [`test/scenarios/pipeline-chaos.test.ts`](test/scenarios/pipeline-chaos.test.ts) |
+| Identical seeds reproduce identical outcome sequences (determinism proof) | [`test/scenarios/resilience.test.ts`](test/scenarios/resilience.test.ts) |
+
+A non-blocking CI job additionally runs the whole suite against `@solana/kit@latest` to catch upstream breakage early.
+
+## Submission checklist
+
+| Requirement | Where to verify |
+|---|---|
+| web3.js v2.0 (`@solana/kit`) compatibility | peer dep `@solana/kit ^6`; tests build real kit RPC clients over shield transports ([`test/unit/tx/pipeline.test.ts`](test/unit/tx/pipeline.test.ts)); CI matrix + `kit-latest` job |
+| Wallet adapter integration (major wallet) | [`src/wallet/standard.ts`](src/wallet/standard.ts) + Phantom demo app [`examples/react-phantom`](examples/react-phantom) |
+| Jito/MEV routing implemented + documented | [`docs/jito-routing.md`](docs/jito-routing.md), [`src/jito/sender.ts`](src/jito/sender.ts), routing-policy tests |
+| Observability exports (OpenTelemetry/Datadog) | [`src/telemetry/otel.ts`](src/telemetry/otel.ts) + Datadog wiring above |
+| Diagnostics CLI functional | `npx solana-shield doctor` (verified against live devnet), `monitor`, `bench`, `tx`, `fees` |
+| 90%+ coverage with network simulation | `pnpm test:coverage` gate in CI; ChaosTransport-driven scenario suite above |
 
 ## Package map
 

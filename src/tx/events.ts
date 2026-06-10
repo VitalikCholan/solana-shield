@@ -30,6 +30,12 @@ export type TxStatusEvent =
       readonly commitment: Commitment;
       readonly slot: bigint;
       readonly confirmedVia: 'ws' | 'poll';
+      /** Route of the most recent broadcast that preceded confirmation. */
+      readonly route: SendRoute;
+      /** Total broadcasts: the initial send plus rebroadcasts. */
+      readonly attempts: number;
+      /** Wall-clock time from pipeline start to confirmation. */
+      readonly durationMs: number;
     }
   | {
       readonly type: 'expired';
