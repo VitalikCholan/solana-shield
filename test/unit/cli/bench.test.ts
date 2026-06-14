@@ -4,7 +4,6 @@ import type { Shield } from '../../../src/index.js';
 import { createShield } from '../../../src/index.js';
 import { createMockTransport } from '../../helpers/mock-transport.js';
 
-// eslint-disable-next-line no-control-regex
 const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, '');
 
 let shield: Shield | undefined;

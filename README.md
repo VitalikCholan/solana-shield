@@ -240,6 +240,8 @@ The suite runs entirely without sockets: every component is a function over `Rpc
 | Blockhash expires under 100% send-loss → exact `TxExpiredError`, never a silent re-sign | [`test/scenarios/pipeline-chaos.test.ts`](test/scenarios/pipeline-chaos.test.ts) |
 | Identical seeds reproduce identical outcome sequences (determinism proof) | [`test/scenarios/resilience.test.ts`](test/scenarios/resilience.test.ts) |
 
+Each guarantee is mapped to its fault and its test in **[docs/resilience.md](docs/resilience.md)** — organized by the rubric's three failure modes (RPC failures, dropped transactions, network congestion), plus a side-by-side "vanilla kit fails / shield survives" comparison.
+
 A non-blocking CI job additionally runs the whole suite against `@solana/kit@latest` to catch upstream breakage early.
 
 ## Submission checklist
