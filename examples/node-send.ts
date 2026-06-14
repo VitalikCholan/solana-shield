@@ -1,16 +1,51 @@
 /**
- * Headless demo: send a self-transfer on devnet through the full solana-shield
- * pipeline and stream every lifecycle event to the console.
+ * Headless demo: send a self-transfer through the full solana-shield pipeline
+ * and stream every lifecycle event to the console.
  *
- * Run:  npx tsx examples/node-send.ts
- * Env:  SHIELD_ENDPOINTS  comma-separated RPC URLs (default: devnet)
- *       SHIELD_KEYPAIR    path to a JSON keypair file (default: generate + airdrop)
+ * Works against any cluster — devnet, a local solana-test-validator, or Surfpool:
+ *
+ *   npx tsx examples/node-send.ts                              # devnet (default)
+ *   SHIELD_ENDPOINTS=localnet npx tsx examples/node-send.ts    # local validator / surfpool
+ *   SHIELD_ENDPOINTS=localnet SHIELD_KEYPAIR=./dev-key.json npx tsx examples/node-send.ts
+ *
+ * Env:  SHIELD_ENDPOINTS  comma-separated RPC URLs or monikers (default: devnet)
+ *       SHIELD_KEYPAIR    path to a JSON keypair file; skips the airdrop when set
  */
 import { readFileSync } from 'node:fs';
-import { airdropFactory, createKeyPairSignerFromBytes, createSolanaRpc, createSolanaRpcSubscriptions, generateKeyPairSigner, lamports } from '@solana/kit';
-import { createShield, transferInstruction } from '../src/index.js';
+import type { Address } from '@solana/kit';
+import {
+  airdropFactory,
+  createKeyPairSignerFromBytes,
+  createSolanaRpc,
+  createSolanaRpcSubscriptions,
+  generateKeyPairSigner,
+  lamports,
+} from '@solana/kit';
+import { createShield, resolveEndpoints, transferInstruction } from '../src/index.js';
 
 const endpoints = (process.env['SHIELD_ENDPOINTS'] ?? 'devnet').split(',').map(s => s.trim());
+const primary = resolveEndpoints(endpoints)[0]!; // first endpoint drives the airdrop + explorer link
+
+/** Airdrop against the *configured* cluster (not hardcoded devnet), with retries
+ *  so a transient public-faucet hiccup doesn't sink the demo. Local validators
+ *  and Surfpool answer instantly and reliably. */
+async function airdrop(recipient: Address) {
+  const rpc = createSolanaRpc(primary.url);
+  const rpcSubscriptions = createSolanaRpcSubscriptions(primary.wsUrl);
+  const requestAirdrop = airdropFactory({ rpc, rpcSubscriptions });
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      await requestAirdrop({ commitment: 'confirmed', lamports: lamports(1_000_000_000n), recipientAddress: recipient });
+      return;
+    } catch (err) {
+      lastErr = err;
+      console.log(`  airdrop attempt ${attempt} failed, retrying...`);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+  throw lastErr;
+}
 
 async function loadSigner() {
   const path = process.env['SHIELD_KEYPAIR'];
@@ -19,15 +54,19 @@ async function loadSigner() {
     return createKeyPairSignerFromBytes(bytes);
   }
   const signer = await generateKeyPairSigner();
-  console.log(`Generated throwaway signer ${signer.address} — requesting devnet airdrop...`);
-  const rpc = createSolanaRpc('https://api.devnet.solana.com');
-  const rpcSubscriptions = createSolanaRpcSubscriptions('wss://api.devnet.solana.com');
-  await airdropFactory({ rpc, rpcSubscriptions })({
-    commitment: 'confirmed',
-    lamports: lamports(1_000_000_000n),
-    recipientAddress: signer.address,
-  });
+  console.log(`Generated throwaway signer ${signer.address} — airdropping via ${primary.url} ...`);
+  await airdrop(signer.address);
   return signer;
+}
+
+function explorerLink(signature: string): string {
+  const url = primary.url;
+  if (url.includes('devnet')) return `https://explorer.solana.com/tx/${signature}?cluster=devnet`;
+  if (url.includes('testnet')) return `https://explorer.solana.com/tx/${signature}?cluster=testnet`;
+  if (url.includes('127.0.0.1') || url.includes('localhost')) {
+    return `https://explorer.solana.com/tx/${signature}?cluster=custom&customUrl=${encodeURIComponent(url)}`;
+  }
+  return `https://explorer.solana.com/tx/${signature}`;
 }
 
 const shield = createShield({
@@ -52,8 +91,11 @@ for await (const event of handle) {
 
 try {
   const confirmed = await handle.result;
-  console.log(`✅ confirmed in slot ${confirmed.slot} via ${confirmed.confirmedVia}`);
-  console.log(`   https://explorer.solana.com/tx/${confirmed.signature}?cluster=devnet`);
+  console.log(
+    `✅ confirmed in slot ${confirmed.slot} via ${confirmed.confirmedVia} ` +
+      `(route ${confirmed.route}, ${confirmed.attempts} broadcast(s), ${confirmed.durationMs}ms)`,
+  );
+  console.log(`   ${explorerLink(confirmed.signature)}`);
 } catch (err) {
   console.error('❌', err);
   process.exitCode = 1;
