@@ -100,6 +100,7 @@
   },
   "devDependencies": {
     "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/sdk-metrics": "^2.8.0",
     "@solana/kit": "^6.9.0",
     "@types/node": "^25.9.2",
     "@vitest/coverage-v8": "^4.1.8",
