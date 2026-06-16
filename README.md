@@ -9,7 +9,7 @@ Solana dApps fail in production for boring reasons: an RPC provider has a bad da
                  ├── rpc                    drop-in kit Rpc, resilient
                  ├── sendReliably()         Jito → RPC fallback, fees, rebroadcast, confirm
                  ├── health / metrics       live endpoint scoring, OpenTelemetry export
-                 └── solana-shield CLI      doctor · monitor · tx · fees
+                 └── solana-shield CLI      doctor · monitor · bench · tx · fees
 ```
 
 ## Features
@@ -18,7 +18,7 @@ Solana dApps fail in production for boring reasons: an RPC provider has a bad da
 - **MEV-protected sends** — route transactions through [Jito block engines](https://docs.jito.wtf/) (regional failover, live tip-floor tracking, 1 rps rate compliance, bundles API) with automatic fallback to regular RPC.
 - **Dynamic fee oracle** — races Helius `getPriorityFeeEstimate`, QuickNode `qn_estimatePriorityFees`, Triton percentile fees, and native `getRecentPrioritizationFees` inside a 400ms budget; aggregates max-of-sources with a hard ceiling so a misbehaving source can never drain you.
 - **Reliable transaction pipeline** — simulation-based compute budgets, WS + polling confirmation race, identical-bytes rebroadcast every 2.5s, exact blockhash-expiry detection. Never silently re-signs.
-- **Wallet-standard adapter** — dependency-free discovery + `TransactionSendingSigner` bridge; works with Phantom, Solflare, and any wallet-standard wallet. React apps can use `@solana/react` signers directly.
+- **Wallet-standard adapter** — dependency-free discovery + a signer bridge that prefers `solana:signTransaction` (the wallet only signs, so shield keeps the bytes → wallet users still get Jito routing *and* rebroadcast), falling back to `solana:signAndSendTransaction`. Works with Phantom, Solflare, and any wallet-standard wallet; `@solana/react` signers work directly.
 - **Observability** — zero-dep in-process metrics, mirrored to OpenTelemetry (→ Datadog, Grafana, anything OTLP) when `@opentelemetry/api` is installed.
 - **Chaos engineering, shipped** — `solana-shield/chaos` injects drops, latency distributions, 429 storms, flapping outages, and slow-loris hangs into any transport, deterministically seeded. It's how this SDK reaches >90% test coverage, and how you can test *your* dApp.
 
@@ -48,7 +48,7 @@ const slot = await shield.rpc.getSlot().send();
 // 2. Reliable sends with a live event stream
 const handle = shield.sendReliably({
   instructions: [transferInstruction(payer.address, recipient, 1_000_000n)],
-  signer: payer, // KeyPairSigner or wallet TransactionSendingSigner
+  signer: payer, // a keypair signer, or a wallet signer (see Wallets below)
 });
 
 for await (const event of handle) console.log(event.type, event);
@@ -109,7 +109,7 @@ watchWallets(wallets => {
   const phantom = wallets.find(w => w.name === 'Phantom');
   // after wallet.features['standard:connect'].connect():
   const signer = createSignerFromWalletAccount(phantom, account);
-  shield.sendReliably({ instructions, signer }); // wallet signs & sends; shield confirms & tracks
+  shield.sendReliably({ instructions, signer }); // wallet signs; shield routes, sends & confirms
 });
 ```
 
@@ -168,6 +168,8 @@ new NodeSDK({
 
 Exported metrics: `solana_shield.rpc.request.duration|count` (per endpoint/method/outcome/failure-kind), `endpoint.health_score`, `endpoint.slot_lag`, `tx.confirmation.duration`, `tx.outcome`, `fees.source.duration`, `jito.tip_lamports`, and more.
 
+Runnable demo: [`examples/otel-console.ts`](examples/otel-console.ts) prints these live to an OpenTelemetry console exporter — swap `ConsoleMetricExporter` for the OTLP one above to ship to Datadog/Grafana.
+
 ## Diagnostics CLI
 
 ```bash
@@ -221,10 +223,21 @@ const sendAndConfirm = sendAndConfirmTransactionFactory({
 });
 ```
 
+## Examples
+
+Runnable against devnet, a local `solana-test-validator`, or [Surfpool](https://surfpool.run):
+
+- [`examples/node-send.ts`](examples/node-send.ts) — headless send through the full pipeline, streaming every lifecycle event. Cluster-agnostic:
+  ```bash
+  SHIELD_ENDPOINTS=localnet npx tsx examples/node-send.ts   # vs. Surfpool / local validator
+  ```
+- [`examples/react-phantom`](examples/react-phantom) — Vite + Phantom dApp: connect, send, watch the live transaction lifecycle and endpoint-health table.
+- [`examples/otel-console.ts`](examples/otel-console.ts) — exports live RPC metrics to OpenTelemetry (console exporter; OTLP for Datadog/Grafana).
+
 ## Testing
 
 ```bash
-pnpm test              # 300+ tests
+pnpm test              # 323 tests
 pnpm test:coverage     # enforces ≥90% lines/branches/functions/statements
 ```
 
