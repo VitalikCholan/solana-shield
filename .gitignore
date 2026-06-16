@@ -4,3 +4,9 @@ coverage/
 *.tsbuildinfo
 .env
 .env.*
+
+# Surfpool / local validator artifacts
+.surfpool/
+test-ledger/
+*-key.json
+dev-key.json

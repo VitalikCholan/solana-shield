@@ -1,0 +1,5 @@
+# Single-package repo — this file hosts pnpm settings that pnpm 10/11 no longer
+# read from package.json's "pnpm" field. Approves esbuild's postinstall so the
+# platform-native binary (needed by tsup + vitest) is built on install.
+onlyBuiltDependencies:
+  - esbuild
