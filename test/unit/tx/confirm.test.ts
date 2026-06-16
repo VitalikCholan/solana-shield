@@ -55,7 +55,7 @@ describe('confirmSignature', () => {
       lastValidBlockHeight: 100n,
       pollIntervalMs: 1,
     });
-    expect(result).toEqual({ type: 'confirmed', slot: 90n, err: null, via: 'poll' });
+    expect(result).toEqual({ type: 'confirmed', signature: SIG, slot: 90n, err: null, via: 'poll' });
   });
 
   it('treats finalized as satisfying confirmed but not vice versa', async () => {
@@ -87,7 +87,7 @@ describe('confirmSignature', () => {
       lastValidBlockHeight: 100n,
       pollIntervalMs: 60_000,
     });
-    expect(result).toEqual({ type: 'confirmed', slot: 91n, err: null, via: 'ws' });
+    expect(result).toEqual({ type: 'confirmed', signature: SIG, slot: 91n, err: null, via: 'ws' });
   });
 
   it('falls back to polling when every subscription fails', async () => {
