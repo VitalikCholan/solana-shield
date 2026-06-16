@@ -1,10 +1,12 @@
 import type {
   Address,
   Commitment,
+  GetAccountInfoApi,
   GetBlockHeightApi,
   GetLatestBlockhashApi,
   GetSignatureStatusesApi,
   Instruction,
+  Nonce,
   Rpc,
   SendTransactionApi,
   Signature,
@@ -29,6 +31,7 @@ import {
   setTransactionMessageComputeUnitPrice,
   setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash,
+  setTransactionMessageLifetimeUsingDurableNonce,
   signAndSendTransactionMessageWithSigners,
   signTransactionMessageWithSigners,
 } from '@solana/kit';
@@ -37,7 +40,8 @@ import type { JitoSenderLike } from '../jito/types.js';
 import type { MetricsRegistry } from '../telemetry/registry.js';
 import type { ConfirmationResult, SignatureSubscriptionsClient } from './confirm.js';
 import { confirmSignature } from './confirm.js';
-import { TxExpiredError, TxFailedError } from './errors.js';
+import { fetchNonceValue } from './nonce.js';
+import { TxExpiredError, TxFailedError, TxSimulationError } from './errors.js';
 import type { TxConfirmedEvent, TxStatusEvent } from './events.js';
 import { EventStream } from './events.js';
 import { startRebroadcast } from './rebroadcast.js';
@@ -47,7 +51,8 @@ const MAX_COMPUTE_UNITS = 1_400_000;
 const DEFAULT_COMPUTE_UNIT_LIMIT = 200_000;
 
 export type PipelineRpc = Rpc<
-  GetBlockHeightApi &
+  GetAccountInfoApi &
+    GetBlockHeightApi &
     GetLatestBlockhashApi &
     GetSignatureStatusesApi &
     SendTransactionApi &
@@ -78,8 +83,39 @@ export interface SendReliablyInput {
   readonly maxMicroLamportsPerCu?: bigint;
   /** Multiplier applied to the simulated compute unit estimate (default 1.1). */
   readonly computeUnitBuffer?: number;
+  /**
+   * Preflight: simulate before broadcasting and reject early with a decoded,
+   * human-readable reason if the tx would fail (default `true`). Catches doomed
+   * transactions cheaply — one simulate call instead of a wasted broadcast.
+   * Applies only when shield owns the signed bytes (not wallet sign-and-send).
+   */
+  readonly preflight?: boolean;
   /** Explicit Jito tip; defaults to the live recommended tip. */
   readonly jitoTipLamports?: bigint;
+  /**
+   * Durable-nonce mode: pin the transaction's lifetime to a nonce account
+   * instead of a recent blockhash, so it **never expires** — it stays landable
+   * until the nonce advances, surviving arbitrary congestion. Requires a
+   * keypair-style signer that can export signed bytes; that signer must be the
+   * nonce authority. `nonce` is auto-fetched from the account when omitted.
+   */
+  readonly durableNonce?: {
+    readonly account: Address;
+    readonly nonce?: Nonce;
+  };
+  /**
+   * Bump the priority fee on each rebroadcast along a multiplier curve. Only
+   * honored in `durableNonce` mode, where it is **safe**: every attempt shares
+   * the nonce, so the first to land advances it and invalidates the rest — at
+   * most one executes. (Escalating a blockhash-lifetime tx would risk
+   * double-execution, so it is intentionally disabled there.)
+   */
+  readonly feeEscalation?: {
+    /** Multiplier applied per rebroadcast (default 1.5 → 1.5×, 2.25×, …). */
+    readonly factor?: number;
+    /** Cap relative to the base estimate (default 5×). */
+    readonly maxMultiplier?: number;
+  };
   readonly rebroadcastIntervalMs?: number;
   readonly pollIntervalMs?: number;
   readonly abortSignal?: AbortSignal;
@@ -171,19 +207,50 @@ async function runPipeline(
   try {
     events.push({ type: 'building' });
 
-    const { value: latest } = await context.rpc
-      .getLatestBlockhash({ commitment })
-      .send({ abortSignal: signal });
-
-    let message = pipe(
-      createTransactionMessage({ version: 0 }),
-      m => setTransactionMessageFeePayerSigner(input.signer, m),
-      m => setTransactionMessageLifetimeUsingBlockhash(latest, m),
-      m => appendTransactionMessageInstructions(input.instructions, m),
-    );
-
+    const durableNonce = input.durableNonce;
     const ownsBytes =
       isTransactionModifyingSigner(input.signer) || isTransactionPartialSigner(input.signer);
+
+    if (durableNonce && !ownsBytes) {
+      throw new Error(
+        'durableNonce requires a keypair-style signer that can export signed bytes (the nonce ' +
+          'authority); sign-and-send-only wallets are not supported in durable-nonce mode.',
+      );
+    }
+
+    // --- lifetime: durable nonce (never expires) or recent blockhash ---
+    let lastValidBlockHeight: bigint | undefined;
+    let lifetimeMessage;
+    if (durableNonce) {
+      const nonceValue =
+        durableNonce.nonce ?? (await fetchNonceValue(context.rpc, durableNonce.account, signal));
+      lifetimeMessage = pipe(
+        createTransactionMessage({ version: 0 }),
+        m => setTransactionMessageFeePayerSigner(input.signer, m),
+        m =>
+          setTransactionMessageLifetimeUsingDurableNonce(
+            {
+              nonce: nonceValue,
+              nonceAccountAddress: durableNonce.account,
+              nonceAuthorityAddress: input.signer.address,
+            },
+            m,
+          ),
+        m => appendTransactionMessageInstructions(input.instructions, m),
+      );
+    } else {
+      const { value: latest } = await context.rpc
+        .getLatestBlockhash({ commitment })
+        .send({ abortSignal: signal });
+      lastValidBlockHeight = latest.lastValidBlockHeight;
+      lifetimeMessage = pipe(
+        createTransactionMessage({ version: 0 }),
+        m => setTransactionMessageFeePayerSigner(input.signer, m),
+        m => setTransactionMessageLifetimeUsingBlockhash(latest, m),
+        m => appendTransactionMessageInstructions(input.instructions, m),
+      );
+    }
+
     const jito = context.jito;
     const wantJito = route !== 'rpc' && jito !== undefined;
     const useJito = wantJito && ownsBytes;
@@ -202,6 +269,7 @@ async function runPipeline(
       events.push({ type: 'jitoFallback', reason: 'signerCannotExportBytes' });
     }
 
+    let message = lifetimeMessage;
     if (useJito) {
       const tipLamports =
         input.jitoTipLamports ?? (await jito.recommendedTipLamports({ signal }));
@@ -212,7 +280,7 @@ async function runPipeline(
       );
     }
 
-    // --- fees ---
+    // --- fees (base estimate) ---
     const writableAddresses = collectWritableAddresses(message);
     let microLamportsPerCu = 1n;
     let feeSourceName = 'default';
@@ -223,26 +291,35 @@ async function runPipeline(
       );
       feeSourceName = context.feeSource.name;
     } catch {
-      // A fee-oracle outage must never block the send; 1 µlamport still lands
-      // in calm conditions and the caller sees the source in the event.
+      // A fee-oracle outage must never block the send; the 1 µlamport floor
+      // still lands in calm conditions and the caller sees the source.
     }
     const ceiling = input.maxMicroLamportsPerCu ?? 5_000_000n;
     if (microLamportsPerCu > ceiling) microLamportsPerCu = ceiling;
-    message = setTransactionMessageComputeUnitPrice(microLamportsPerCu, message);
+    if (microLamportsPerCu < 1n) microLamportsPerCu = 1n;
+
+    // Set the CU price BEFORE estimating, so the simulation includes the
+    // SetComputeUnitPrice instruction's own cost — otherwise the estimate omits
+    // it and the final tx (price + limit + payload) can exceed the limit
+    // (ComputationalBudgetExceeded). The estimator injects the limit instruction
+    // itself, so simulating the priced message accounts for both budget ixs.
+    const pricedMessage = setTransactionMessageComputeUnitPrice(microLamportsPerCu, message);
 
     let computeUnitLimit = DEFAULT_COMPUTE_UNIT_LIMIT;
     try {
-      const estimated = await estimateComputeUnitLimitFactory({ rpc: context.rpc })(message, {
+      const estimated = await estimateComputeUnitLimitFactory({ rpc: context.rpc })(pricedMessage, {
         abortSignal: signal,
         commitment,
       });
       const buffer = input.computeUnitBuffer ?? 1.1;
-      computeUnitLimit = Math.min(MAX_COMPUTE_UNITS, Math.ceil(estimated * buffer));
+      // Buffer for jitter, plus a flat 150-CU floor of headroom (over-paying a
+      // few hundred CU costs a fraction of a lamport; under-paying is a hard fail).
+      computeUnitLimit = Math.min(MAX_COMPUTE_UNITS, Math.ceil(estimated * buffer) + 150);
     } catch {
       // Simulation can fail for state-dependent transactions; fall back to the
       // default limit rather than blocking the send.
     }
-    message = setTransactionMessageComputeUnitLimit(computeUnitLimit, message);
+    const budgetedBase = setTransactionMessageComputeUnitLimit(computeUnitLimit, pricedMessage);
     events.push({
       type: 'feeEstimated',
       microLamportsPerCu,
@@ -250,21 +327,55 @@ async function runPipeline(
       source: feeSourceName,
     });
 
+    // Fee escalation is only safe — and only enabled — under a durable nonce:
+    // every attempt shares the nonce, so the first to land invalidates the rest.
+    const escalate = Boolean(durableNonce) && input.feeEscalation !== undefined;
+    const escFactor = input.feeEscalation?.factor ?? 1.5;
+    const escMaxMult = input.feeEscalation?.maxMultiplier ?? 5;
+    const priceFor = (mult: number): bigint => {
+      const raw = BigInt(Math.ceil(Number(microLamportsPerCu) * Math.min(mult, escMaxMult)));
+      return raw > ceiling ? ceiling : raw < 1n ? 1n : raw;
+    };
+
     // --- sign + send ---
     let txSignature: Signature;
     let stopRebroadcast: (() => void) | undefined;
     let lastRoute: 'jito' | 'rpc' = 'rpc';
     let broadcastAttempts = 1;
+    const sentSignatures = new Set<Signature>();
 
     if (ownsBytes) {
-      const transaction = await signTransactionMessageWithSigners(message);
-      txSignature = getSignatureFromTransaction(transaction);
+      const signFor = async (mult: number) => {
+        const priced = setTransactionMessageComputeUnitPrice(priceFor(mult), budgetedBase);
+        const tx = await signTransactionMessageWithSigners(priced);
+        return { wire: getBase64EncodedWireTransaction(tx), sig: getSignatureFromTransaction(tx) };
+      };
+      type Wire = Awaited<ReturnType<typeof signFor>>['wire'];
+
+      let current = await signFor(1);
+      txSignature = current.sig;
+      sentSignatures.add(current.sig);
       signatureForFailure = txSignature;
       events.push({ type: 'signed', signature: txSignature });
       sink.onSigned(txSignature);
 
-      const wire = getBase64EncodedWireTransaction(transaction);
-      const sendOnce = async (preferJito: boolean): Promise<'jito' | 'rpc'> => {
+      // Preflight: catch a doomed tx cheaply, with a decoded reason, before broadcast.
+      if (input.preflight !== false) {
+        try {
+          const sim = await context.rpc
+            .simulateTransaction(current.wire, { encoding: 'base64', sigVerify: false })
+            .send({ abortSignal: signal });
+          if (sim.value.err != null) {
+            throw new TxSimulationError(sim.value.err, sim.value.logs ?? []);
+          }
+        } catch (err) {
+          if (err instanceof TxSimulationError) throw err;
+          // A simulation *infrastructure* failure (node down, dropped) must not
+          // block the send — only a returned `err` dooms the transaction.
+        }
+      }
+
+      const sendWire = async (wire: Wire, preferJito: boolean): Promise<'jito' | 'rpc'> => {
         if (preferJito && useJito) {
           try {
             await jito.sendTransaction(wire, { signal });
@@ -281,21 +392,16 @@ async function runPipeline(
           }
         }
         await context.rpc
-          .sendTransaction(wire, {
-            encoding: 'base64',
-            maxRetries: 0n,
-            skipPreflight: true,
-          })
+          .sendTransaction(wire, { encoding: 'base64', maxRetries: 0n, skipPreflight: true })
           .send({ abortSignal: signal });
         return 'rpc';
       };
 
-      const via = await sendOnce(true);
-      lastRoute = via;
+      lastRoute = await sendWire(current.wire, true);
       events.push({
         type: 'sent',
-        via,
-        endpoint: via === 'jito' ? jito!.label : 'rpc-pool',
+        via: lastRoute,
+        endpoint: lastRoute === 'jito' ? jito!.label : 'rpc-pool',
         attempt: 1,
       });
 
@@ -309,11 +415,22 @@ async function runPipeline(
       void startRebroadcast({
         // Alternate routes so a black-holing Jito region can't absorb every
         // resend — except under the strict 'jito' policy, which never mixes.
+        // Under fee escalation, re-sign at a higher price each tick (a new
+        // signature, all pinned to the same nonce → at most one lands).
         send: async attempt => {
-          const via = await sendOnce(useJito && (route === 'jito' || attempt % 2 === 1));
-          lastRoute = via;
+          let price = microLamportsPerCu;
+          if (escalate) {
+            const mult = Math.min(escMaxMult, escFactor ** attempt);
+            current = await signFor(mult);
+            sentSignatures.add(current.sig);
+            price = priceFor(mult);
+          }
+          lastRoute = await sendWire(
+            current.wire,
+            useJito && (route === 'jito' || attempt % 2 === 1),
+          );
           broadcastAttempts = attempt + 1;
-          events.push({ type: 'resent', via, attempt });
+          events.push({ type: 'resent', via: lastRoute, attempt, microLamportsPerCu: price });
         },
         ...(input.rebroadcastIntervalMs !== undefined
           ? { intervalMs: input.rebroadcastIntervalMs }
@@ -324,11 +441,13 @@ async function runPipeline(
       // Wallet-style sending signer: the wallet signs AND sends. We don't own
       // the wire bytes, so there is no Jito routing and no rebroadcast — but we
       // still own confirmation, expiry tracking, and status events.
-      assertIsTransactionMessageWithSingleSendingSigner(message);
-      const signatureBytes = await signAndSendTransactionMessageWithSigners(message, {
+      const walletMessage = setTransactionMessageComputeUnitPrice(priceFor(1), budgetedBase);
+      assertIsTransactionMessageWithSingleSendingSigner(walletMessage);
+      const signatureBytes = await signAndSendTransactionMessageWithSigners(walletMessage, {
         abortSignal: signal,
       });
       txSignature = getBase58Decoder().decode(signatureBytes) as Signature;
+      sentSignatures.add(txSignature);
       signatureForFailure = txSignature;
       events.push({ type: 'signed', signature: txSignature });
       sink.onSigned(txSignature);
@@ -341,8 +460,9 @@ async function runPipeline(
         rpc: context.rpc,
         ...(context.subscriptions ? { subscriptions: context.subscriptions } : {}),
         signature: txSignature,
+        getSignatures: () => [...sentSignatures],
         commitment,
-        lastValidBlockHeight: latest.lastValidBlockHeight,
+        ...(lastValidBlockHeight !== undefined ? { lastValidBlockHeight } : {}),
         ...(input.pollIntervalMs !== undefined ? { pollIntervalMs: input.pollIntervalMs } : {}),
         signal,
       });
@@ -351,23 +471,24 @@ async function runPipeline(
     }
 
     if (confirmation.type === 'expired') {
+      const lvbh = lastValidBlockHeight ?? 0n;
       events.push({
         type: 'expired',
         signature: txSignature,
-        lastValidBlockHeight: latest.lastValidBlockHeight,
+        lastValidBlockHeight: lvbh,
         blockHeight: confirmation.blockHeight,
       });
       context.metrics?.count('solana_shield.tx.outcome', { outcome: 'expired' });
-      throw new TxExpiredError(txSignature, latest.lastValidBlockHeight, confirmation.blockHeight);
+      throw new TxExpiredError(txSignature, lvbh, confirmation.blockHeight);
     }
     if (confirmation.err != null) {
       context.metrics?.count('solana_shield.tx.outcome', { outcome: 'failed' });
-      throw new TxFailedError(txSignature, confirmation.err);
+      throw new TxFailedError(confirmation.signature, confirmation.err);
     }
 
     const confirmedEvent: TxConfirmedEvent = {
       type: 'confirmed',
-      signature: txSignature,
+      signature: confirmation.signature,
       commitment,
       slot: confirmation.slot,
       confirmedVia: confirmation.via,

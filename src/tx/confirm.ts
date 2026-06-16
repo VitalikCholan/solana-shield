@@ -26,16 +26,34 @@ export interface SignatureSubscriptionsClient {
 }
 
 export type ConfirmationResult =
-  | { readonly type: 'confirmed'; readonly slot: bigint; readonly err: unknown; readonly via: 'ws' | 'poll' }
+  | {
+      readonly type: 'confirmed';
+      readonly signature: Signature;
+      readonly slot: bigint;
+      readonly err: unknown;
+      readonly via: 'ws' | 'poll';
+    }
   | { readonly type: 'expired'; readonly blockHeight: bigint };
 
 export interface ConfirmOptions {
   readonly rpc: Rpc<GetSignatureStatusesApi & GetBlockHeightApi>;
   /** Subscription clients to try in order; all may fail — polling always backstops. */
   readonly subscriptions?: readonly SignatureSubscriptionsClient[];
+  /** Primary signature (used for the WS subscription). */
   readonly signature: Signature;
+  /**
+   * Dynamic signature set to poll. Defaults to `[signature]`. Under fee
+   * escalation each rebroadcast produces a new signature (all pinned to the
+   * same durable nonce, so at most one can land) — this lets polling watch the
+   * whole set and report whichever confirms.
+   */
+  readonly getSignatures?: () => readonly Signature[];
   readonly commitment: Commitment;
-  readonly lastValidBlockHeight: bigint;
+  /**
+   * Blockhash expiry boundary. Omit for durable-nonce transactions, which never
+   * expire — confirmation then runs until success or the caller aborts.
+   */
+  readonly lastValidBlockHeight?: bigint;
   readonly pollIntervalMs?: number;
   readonly signal?: AbortSignal;
 }
@@ -50,15 +68,14 @@ function meetsCommitment(status: string | null | undefined, commitment: Commitme
 /**
  * Dual-path confirmation: a WebSocket `signatureNotifications` subscription and a
  * `getSignatureStatuses` polling loop race each other; whichever resolves first
- * wins. Polling also owns blockhash-expiry detection, and a final status check
- * runs after the expiry boundary to close the "landed in the last block" race.
+ * wins. Polling owns expiry detection (when a `lastValidBlockHeight` is given),
+ * with a final status check after the boundary to close the "landed in the last
+ * block" race. With no `lastValidBlockHeight` (durable nonce) it never expires.
  */
 export async function confirmSignature(options: ConfirmOptions): Promise<ConfirmationResult> {
   const pollIntervalMs = options.pollIntervalMs ?? 2000;
   const done = new AbortController();
-  const signal = options.signal
-    ? mergeSignals(options.signal, done.signal)
-    : done.signal;
+  const signal = options.signal ? mergeSignals(options.signal, done.signal) : done.signal;
 
   try {
     return await Promise.race([
@@ -83,6 +100,7 @@ async function wsWatch(
       const value = (notification as { value?: { err?: unknown } }).value;
       return {
         type: 'confirmed',
+        signature: options.signature,
         slot: notification.context.slot,
         err: value && typeof value === 'object' && 'err' in value ? value.err : null,
         via: 'ws',
@@ -109,14 +127,16 @@ async function pollLoop(
     const status = await checkStatus(options, signal);
     if (status) return status;
 
-    const blockHeight = await options.rpc
-      .getBlockHeight({ commitment: options.commitment })
-      .send({ abortSignal: signal });
-    if (blockHeight > options.lastValidBlockHeight) {
-      // The lifetime is over — but the tx may have landed in one of the last
-      // blocks between our previous poll and now. One final authoritative check.
-      const lastCheck = await checkStatus(options, signal);
-      return lastCheck ?? { type: 'expired', blockHeight };
+    if (options.lastValidBlockHeight !== undefined) {
+      const blockHeight = await options.rpc
+        .getBlockHeight({ commitment: options.commitment })
+        .send({ abortSignal: signal });
+      if (blockHeight > options.lastValidBlockHeight) {
+        // The lifetime is over — but the tx may have landed in one of the last
+        // blocks between our previous poll and now. One final authoritative check.
+        const lastCheck = await checkStatus(options, signal);
+        return lastCheck ?? { type: 'expired', blockHeight };
+      }
     }
 
     await sleep(pollIntervalMs, signal);
@@ -127,12 +147,15 @@ async function checkStatus(
   options: ConfirmOptions,
   signal: AbortSignal,
 ): Promise<ConfirmationResult | undefined> {
+  const signatures = options.getSignatures?.() ?? [options.signature];
   const response = await options.rpc
-    .getSignatureStatuses([options.signature])
+    .getSignatureStatuses(signatures)
     .send({ abortSignal: signal });
-  const status = response.value[0];
-  if (status && meetsCommitment(status.confirmationStatus, options.commitment)) {
-    return { type: 'confirmed', slot: status.slot, err: status.err, via: 'poll' };
+  for (let i = 0; i < signatures.length; i++) {
+    const status = response.value[i];
+    if (status && meetsCommitment(status.confirmationStatus, options.commitment)) {
+      return { type: 'confirmed', signature: signatures[i]!, slot: status.slot, err: status.err, via: 'poll' };
+    }
   }
   return undefined;
 }

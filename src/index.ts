@@ -58,6 +58,32 @@ export interface CreateShieldOptions {
  * oracle (provider-matched sources + native fallback), optional Jito routing,
  * health registry, metrics, and the `sendReliably` transaction pipeline.
  */
+/**
+ * The "easy button": a fully-composed, sensibly-defaulted client from just a
+ * list of endpoints. Turns on hedged reads and request coalescing (the
+ * latency/efficiency wins most apps want) on top of the always-on retry +
+ * failover + health scoring. Power users can still reach for {@link createShield}
+ * to compose by hand; `overrides` are merged over the defaults here.
+ *
+ * @example
+ * const shield = createRecommendedShield(['https://rpc1...', 'https://rpc2...']);
+ */
+export function createRecommendedShield(
+  endpoints: ShieldConfig['endpoints'],
+  overrides: Partial<Omit<ShieldConfig, 'endpoints'>> = {},
+  options: CreateShieldOptions = {},
+): Shield {
+  return createShield(
+    {
+      endpoints,
+      hedging: { enabled: true },
+      coalescing: true,
+      ...overrides,
+    },
+    options,
+  );
+}
+
 export function createShield(config: ShieldConfig, options: CreateShieldOptions = {}): Shield {
   const metrics = new MetricsRegistry();
   const endpoints = resolveEndpoints(config.endpoints);

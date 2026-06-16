@@ -6,7 +6,8 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       include: ['src/**'],
-      exclude: ['src/cli/main.ts'],
+      // CLI entry + React hooks are thin glue exercised by examples, not unit-tested.
+      exclude: ['src/cli/main.ts', 'src/react/**'],
       reporter: ['text', 'html', 'lcov'],
       thresholds: {
         lines: 90,

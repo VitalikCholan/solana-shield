@@ -23,7 +23,13 @@ export type TxStatusEvent =
       readonly reason: 'signerCannotExportBytes' | 'jitoUnavailable' | 'jitoSendFailed';
       readonly detail?: string | ClassifiedFailure;
     }
-  | { readonly type: 'resent'; readonly via: SendRoute; readonly attempt: number }
+  | {
+      readonly type: 'resent';
+      readonly via: SendRoute;
+      readonly attempt: number;
+      /** Priority fee used for this rebroadcast (climbs under fee escalation). */
+      readonly microLamportsPerCu?: bigint;
+    }
   | {
       readonly type: 'confirmed';
       readonly signature: Signature;

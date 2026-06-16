@@ -18,8 +18,12 @@ Solana dApps fail in production for boring reasons: an RPC provider has a bad da
 - **MEV-protected sends** — route transactions through [Jito block engines](https://docs.jito.wtf/) (regional failover, live tip-floor tracking, 1 rps rate compliance, bundles API) with automatic fallback to regular RPC.
 - **Dynamic fee oracle** — races Helius `getPriorityFeeEstimate`, QuickNode `qn_estimatePriorityFees`, Triton percentile fees, and native `getRecentPrioritizationFees` inside a 400ms budget; aggregates max-of-sources with a hard ceiling so a misbehaving source can never drain you.
 - **Reliable transaction pipeline** — simulation-based compute budgets, WS + polling confirmation race, identical-bytes rebroadcast every 2.5s, exact blockhash-expiry detection. Never silently re-signs.
+- **Durable-nonce mode — transactions that survive blockhash expiry entirely.** Opt into `sendReliably({ durableNonce })` and the tx pins its lifetime to a nonce account instead of a ~60s blockhash: it stays landable through arbitrary congestion until it confirms or you cancel. Pairs with **safe fee escalation** (`feeEscalation`) — each rebroadcast re-signs at a higher priority fee, and because every attempt shares the nonce, the first to land invalidates the rest, so it can never double-execute (which naive blockhash fee-bumping risks).
 - **Wallet-standard adapter** — dependency-free discovery + a signer bridge that prefers `solana:signTransaction` (the wallet only signs, so shield keeps the bytes → wallet users still get Jito routing *and* rebroadcast), falling back to `solana:signAndSendTransaction`. Works with Phantom, Solflare, and any wallet-standard wallet; `@solana/react` signers work directly.
 - **Observability** — zero-dep in-process metrics, mirrored to OpenTelemetry (→ Datadog, Grafana, anything OTLP) when `@opentelemetry/api` is installed.
+- **React hooks** — `solana-shield/react` ships `useShield`, `useSendReliably` (live `building → … → confirmed` status for your UI) and `useEndpointHealth`. Optional peer dep; the core stays framework-agnostic.
+- **One-line preset** — `createRecommendedShield(endpoints)` returns a fully-composed, sensibly-defaulted client (retry + failover + hedging + coalescing) for everyone who doesn't want to hand-compose middleware.
+- **Actionable errors** — failures don't surface as raw RPC noise: `AllEndpointsFailedError` carries every classified cause *and* a remediation hint ("every endpoint is rate-limiting — add endpoints, set an rps cap, or raise your tier").
 - **Chaos engineering, shipped** — `solana-shield/chaos` injects drops, latency distributions, 429 storms, flapping outages, and slow-loris hangs into any transport, deterministically seeded. It's how this SDK reaches >90% test coverage, and how you can test *your* dApp.
 
 ## Install
@@ -41,6 +45,10 @@ const shield = createShield({
   ],
   jito: { regions: ['frankfurt', 'amsterdam'] },      // omit for RPC-only routing
 });
+
+// …or the easy button — sensible defaults (retry + failover + hedging + coalescing):
+// import { createRecommendedShield } from 'solana-shield';
+// const shield = createRecommendedShield(['https://rpc1...', 'https://rpc2...']);
 
 // 1. A drop-in, resilient kit RPC — use it anywhere an Rpc is expected
 const slot = await shield.rpc.getSlot().send();
@@ -78,6 +86,27 @@ const { rpc } = createShield({ endpoints: ['https://rpc1...', 'https://rpc2...']
 | `'auto'` (default) | Jito first when configured, automatic RPC fallback with a `jitoFallback` event |
 | `'jito'` | Strict: failures surface, a frontrun-protected send is **never** silently downgraded to public RPC |
 | `'rpc'` | Never touches Jito |
+
+### Surviving congestion: durable nonce + fee escalation
+
+For transactions that *must* land through a congestion storm, pin the lifetime to
+a [durable nonce account](https://solana.com/developers/courses/offline-transactions/durable-nonces)
+instead of a blockhash — it never expires:
+
+```ts
+const handle = shield.sendReliably({
+  instructions,
+  signer,                                   // keypair-style; must be the nonce authority
+  durableNonce: { account: myNonceAccount }, // nonce value auto-fetched if omitted
+  feeEscalation: { factor: 1.5, maxMultiplier: 5 }, // bump the fee each rebroadcast
+});
+```
+
+It rebroadcasts (climbing the priority fee) until the tx confirms or you abort —
+no `TxExpiredError`. Fee escalation is **only** enabled in durable-nonce mode,
+where it's safe: every attempt shares the nonce, so the first to land advances it
+and invalidates the rest (escalating a blockhash tx would risk double-execution,
+so it's intentionally disabled there).
 
 ### Composing the transport yourself
 
@@ -128,6 +157,31 @@ The bridge picks the **best wallet feature automatically**:
 Coming from legacy `@solana/web3.js` 1.x objects (`PublicKey`,
 `VersionedTransaction`)? Use [`@solana/compat`](https://www.npmjs.com/package/@solana/compat)
 to convert to kit types at the boundary — everything here speaks kit.
+
+## React
+
+```tsx
+import { useShield, useSendReliably, useEndpointHealth } from 'solana-shield/react';
+
+function Pay({ signer, instructions }) {
+  const shield = useShield({ endpoints: ['https://rpc1...', 'https://rpc2...'] });
+  const tx = useSendReliably(shield);
+  const health = useEndpointHealth(shield); // live per-endpoint snapshots
+
+  return (
+    <>
+      <button disabled={tx.isPending} onClick={() => tx.send({ instructions, signer })}>
+        {tx.isPending ? tx.status : 'Send'}   {/* building → signed → sent → confirmed */}
+      </button>
+      {tx.result && <p>✅ {tx.result.signature} in slot {String(tx.result.slot)}</p>}
+      {tx.error != null && <p>❌ {String(tx.error)}</p>}
+      <ul>{health.map(h => <li key={h.id}>{h.label}: {h.score.toFixed(2)}</li>)}</ul>
+    </>
+  );
+}
+```
+
+`react` is an optional peer dependency — installing solana-shield doesn't pull React into non-React apps. The hooks are thin wrappers over the same `sendReliably` event stream and `health` snapshots the rest of the SDK exposes.
 
 ## Chaos testing your dApp
 
@@ -280,5 +334,6 @@ A non-blocking CI job additionally runs the whole suite against `@solana/kit@lat
 | `solana-shield/wallet` | wallet-standard discovery + signer bridge |
 | `solana-shield/telemetry` | metrics registry + OpenTelemetry mirror |
 | `solana-shield/chaos` | `createChaosTransport`, scenario presets, seeded PRNG |
+| `solana-shield/react` | `useShield`, `useSendReliably`, `useEndpointHealth` (optional peer dep: react) |
 
 Node ≥ 20 · TypeScript strict · ESM + CJS · browser-safe core (Node APIs only in the CLI) · MIT

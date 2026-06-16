@@ -11,6 +11,7 @@ export default defineConfig([
       'wallet/index': 'src/wallet/index.ts',
       'telemetry/index': 'src/telemetry/index.ts',
       'chaos/index': 'src/chaos/index.ts',
+      'react/index': 'src/react/index.ts',
     },
     format: ['esm', 'cjs'],
     dts: true,

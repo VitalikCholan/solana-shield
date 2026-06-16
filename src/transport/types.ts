@@ -75,10 +75,41 @@ export class TransportTimeoutError extends Error {
 /** Thrown when every attempt has been exhausted; carries the per-attempt failures. */
 export class AllEndpointsFailedError extends Error {
   override readonly name = 'AllEndpointsFailedError';
+  /** A plain-language suggestion for what to do, derived from the failures. */
+  readonly remediation: string;
   constructor(readonly failures: readonly ClassifiedFailure[]) {
+    const remediation = suggestRemediation(failures);
     super(
       `All RPC attempts failed (${failures.length} attempt${failures.length === 1 ? '' : 's'}): ` +
-        failures.map(f => f.message).join('; '),
+        failures.map(f => f.message).join('; ') +
+        (remediation ? `\n→ ${remediation}` : ''),
     );
+    this.remediation = remediation;
   }
+}
+
+/**
+ * Turn a set of classified failures into an actionable hint. Beats throwing a
+ * raw RPC error: it tells the developer what was tried and what to do next.
+ */
+export function suggestRemediation(failures: readonly ClassifiedFailure[]): string {
+  if (failures.length === 0) return '';
+  const every = (pred: (f: ClassifiedFailure) => boolean): boolean => failures.every(pred);
+  const some = (pred: (f: ClassifiedFailure) => boolean): boolean => failures.some(pred);
+  const isRateLimited = (f: ClassifiedFailure): boolean =>
+    f.httpStatus === 429 || /rate limit/i.test(f.message);
+
+  if (some(f => f.markDead)) {
+    return 'an endpoint rejected authentication (401/403) or was not found (404) — check the API key and URL for the failing endpoint(s).';
+  }
+  if (every(isRateLimited)) {
+    return 'every endpoint is rate-limiting (429) — add more endpoints, set a per-endpoint `rps` cap to stay under the limit, or raise your provider tier.';
+  }
+  if (every(f => f.kind === 'network' || f.kind === 'timeout')) {
+    return 'every endpoint was unreachable or timed out — check network connectivity and the endpoint URLs, or raise `requestTimeoutMs`.';
+  }
+  if (every(f => f.kind === 'rpc')) {
+    return 'every endpoint returned node-health errors (behind/unavailable) — your nodes may be lagging the cluster; add a healthier endpoint.';
+  }
+  return 'add more healthy endpoints, or inspect the per-attempt failures above for the dominant cause.';
 }

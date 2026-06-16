@@ -1,9 +1,10 @@
-import type { Wallet, WalletAccount } from '@wallet-standard/base';
-import { useEffect, useMemo, useRef, useState } from 'react';
-import type { EndpointHealthSnapshot, TxStatusEvent } from 'solana-shield';
-import { createShield, transferInstruction } from 'solana-shield';
-import { createSignerFromWalletAccount, watchWallets } from 'solana-shield/wallet';
 import { address } from '@solana/kit';
+import type { Wallet, WalletAccount } from '@wallet-standard/base';
+import { useEffect, useState } from 'react';
+import { transferInstruction } from 'solana-shield';
+import type { TxStatusEvent } from 'solana-shield';
+import { useEndpointHealth, useSendReliably, useShield } from 'solana-shield/react';
+import { createSignerFromWalletAccount, watchWallets } from 'solana-shield/wallet';
 
 interface ConnectFeature {
   connect(): Promise<{ accounts: readonly WalletAccount[] }>;
@@ -14,29 +15,15 @@ function stringify(event: TxStatusEvent): string {
 }
 
 export function App() {
-  const shield = useMemo(
-    () =>
-      createShield({
-        endpoints: ['devnet'],
-        // Add your own endpoints for real failover, e.g.:
-        // endpoints: ['https://devnet.helius-rpc.com/?api-key=KEY', 'devnet'],
-      }),
-    [],
-  );
-  useEffect(() => () => shield.destroy(), [shield]);
+  // The whole SDK, wired with three hooks: a resilient client, a live send, and live health.
+  const shield = useShield({ endpoints: ['devnet'] });
+  const tx = useSendReliably(shield);
+  const health = useEndpointHealth(shield, 1000);
 
   const [wallets, setWallets] = useState<readonly Wallet[]>([]);
   const [account, setAccount] = useState<{ wallet: Wallet; account: WalletAccount }>();
-  const [events, setEvents] = useState<TxStatusEvent[]>([]);
-  const [health, setHealth] = useState<EndpointHealthSnapshot[]>([]);
-  const [busy, setBusy] = useState(false);
-  const walletRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => watchWallets(setWallets), []);
-  useEffect(() => {
-    const interval = setInterval(() => setHealth(shield.health.snapshots()), 1000);
-    return () => clearInterval(interval);
-  }, [shield]);
 
   async function connect(wallet: Wallet) {
     const feature = wallet.features['standard:connect'] as ConnectFeature | undefined;
@@ -45,29 +32,17 @@ export function App() {
     if (solanaAccount) setAccount({ wallet, account: solanaAccount });
   }
 
-  async function send() {
+  function send() {
     if (!account) return;
-    setBusy(true);
-    setEvents([]);
-    try {
-      const signer = createSignerFromWalletAccount(account.wallet, account.account, {
-        chain: 'solana:devnet',
-      });
-      const self = address(account.account.address);
-      const handle = shield.sendReliably({
-        instructions: [transferInstruction(self, self, 1000n)],
-        signer,
-      });
-      for await (const event of handle) {
-        setEvents(prev => [...prev, event]);
-      }
-    } finally {
-      setBusy(false);
-    }
+    const signer = createSignerFromWalletAccount(account.wallet, account.account, {
+      chain: 'solana:devnet',
+    });
+    const self = address(account.account.address);
+    tx.send({ instructions: [transferInstruction(self, self, 1000n)], signer });
   }
 
   return (
-    <div ref={walletRef}>
+    <div>
       <h1>solana-shield × Phantom (devnet)</h1>
 
       {!account && (
@@ -88,16 +63,23 @@ export function App() {
           <p>
             {account.wallet.name}: <code>{account.account.address}</code>
           </p>
-          <button disabled={busy} onClick={() => void send()}>
-            {busy ? 'Sending…' : 'Send 1000 lamports to self (devnet)'}
+          <button disabled={tx.isPending} onClick={send}>
+            {tx.isPending ? `${tx.status}…` : 'Send 1000 lamports to self (devnet)'}
           </button>
+          {tx.result && (
+            <p className="event confirmed">
+              ✅ confirmed in slot {String(tx.result.slot)} via {tx.result.confirmedVia} (route{' '}
+              {tx.result.route}, {tx.result.attempts} broadcast(s), {tx.result.durationMs}ms)
+            </p>
+          )}
+          {tx.error != null && <p className="event failed">❌ {String(tx.error)}</p>}
         </section>
       )}
 
-      {events.length > 0 && (
+      {tx.events.length > 0 && (
         <section>
           <h2>Transaction lifecycle</h2>
-          {events.map((event, i) => (
+          {tx.events.map((event, i) => (
             <div key={i} className={`event ${event.type}`}>
               {stringify(event)}
             </div>

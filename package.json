@@ -53,6 +53,11 @@
       "types": "./dist/chaos/index.d.ts",
       "import": "./dist/chaos/index.js",
       "require": "./dist/chaos/index.cjs"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js",
+      "require": "./dist/react/index.cjs"
     }
   },
   "files": [
@@ -86,10 +91,14 @@
   },
   "peerDependencies": {
     "@opentelemetry/api": "^1.9.0",
-    "@solana/kit": "^6.0.0"
+    "@solana/kit": "^6.0.0",
+    "react": ">=18"
   },
   "peerDependenciesMeta": {
     "@opentelemetry/api": {
+      "optional": true
+    },
+    "react": {
       "optional": true
     }
   },
@@ -103,9 +112,11 @@
     "@opentelemetry/sdk-metrics": "^2.8.0",
     "@solana/kit": "^6.9.0",
     "@types/node": "^25.9.2",
+    "@types/react": "^19.2.0",
     "@vitest/coverage-v8": "^4.1.8",
     "@wallet-standard/base": "^1.1.1",
     "eslint": "^10.4.1",
+    "react": "^19.2.0",
     "tsup": "^8.5.1",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.61.0",
